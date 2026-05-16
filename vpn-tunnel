@@ -2,13 +2,17 @@
 # Управление TUN VPN (sing-box). Нужны права root.
 set -e
 
+SING_BOX_PID=/run/sing-box.pid
+SING_BOX_LOG=/var/log/sing-box.log
+SING_BOX_CONF=/etc/sing-box
+
 usage() {
 	echo "Usage: sudo vpn-tunnel {on|off|status|restart|apply|apply-start}" >&2
-	echo "  on|up      — поднять туннель (systemctl start sing-box)" >&2
-	echo "  off|down   — опустить туннель" >&2
-	echo "  status     — состояние сервиса" >&2
-	echo "  restart    — перезапуск с текущим config" >&2
-	echo "  apply      — пересобрать config из vless.url; VPN вкл. только если уже был вкл." >&2
+	echo "  on|up       — поднять туннель" >&2
+	echo "  off|down    — опустить туннель" >&2
+	echo "  status      — состояние сервиса" >&2
+	echo "  restart     — перезапуск с текущим config" >&2
+	echo "  apply       — пересобрать config из vless.url; VPN вкл. только если уже был вкл." >&2
 	echo "  apply-start — как apply, затем включить VPN" >&2
 	exit 2
 }
@@ -18,14 +22,72 @@ usage() {
 	exit 1
 }
 
+_has_systemctl() { command -v systemctl >/dev/null 2>&1; }
+
+_direct_is_running() {
+	[ -f "$SING_BOX_PID" ] && kill -0 "$(cat "$SING_BOX_PID")" 2>/dev/null
+}
+
+_direct_start() {
+	if _direct_is_running; then
+		echo "sing-box already running (pid $(cat "$SING_BOX_PID"))"
+		return 0
+	fi
+	nohup sing-box run -C "$SING_BOX_CONF" >>"$SING_BOX_LOG" 2>&1 &
+	echo $! >"$SING_BOX_PID"
+	sleep 1
+	_direct_is_running || {
+		echo "sing-box failed to start. Check: $SING_BOX_LOG" >&2
+		exit 1
+	}
+	echo "sing-box started (pid $(cat "$SING_BOX_PID"))"
+}
+
+_direct_stop() {
+	if [ -f "$SING_BOX_PID" ]; then
+		kill "$(cat "$SING_BOX_PID")" 2>/dev/null || true
+		rm -f "$SING_BOX_PID"
+	fi
+	echo "sing-box stopped"
+}
+
+_direct_restart() {
+	_direct_stop
+	sleep 1
+	_direct_start
+}
+
+_direct_status() {
+	if _direct_is_running; then
+		echo "sing-box is active (pid $(cat "$SING_BOX_PID"), no systemd)"
+	else
+		echo "sing-box is inactive (no systemd)"
+		return 1
+	fi
+}
+
 cmd="${1:-}"
-case "$cmd" in
-on | up | start) systemctl start sing-box ;;
-off | down | stop) systemctl stop sing-box ;;
-status) systemctl status sing-box --no-pager ;;
-restart) systemctl restart sing-box ;;
-apply) exec sing-box-apply-vless ;;
-apply-start) exec sing-box-apply-vless --start ;;
-"") usage ;;
-*) usage ;;
-esac
+
+if _has_systemctl; then
+	case "$cmd" in
+	on | up | start)   systemctl start sing-box ;;
+	off | down | stop) systemctl stop sing-box ;;
+	status)            systemctl status sing-box --no-pager ;;
+	restart)           systemctl restart sing-box ;;
+	apply)             exec sing-box-apply-vless ;;
+	apply-start)       exec sing-box-apply-vless --start ;;
+	"")                usage ;;
+	*)                 usage ;;
+	esac
+else
+	case "$cmd" in
+	on | up | start)   _direct_start ;;
+	off | down | stop) _direct_stop ;;
+	status)            _direct_status ;;
+	restart)           _direct_restart ;;
+	apply)             exec sing-box-apply-vless ;;
+	apply-start)       exec sing-box-apply-vless --start ;;
+	"")                usage ;;
+	*)                 usage ;;
+	esac
+fi

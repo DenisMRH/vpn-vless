@@ -129,6 +129,10 @@ EOF
 }
 
 ensure_systemd_service() {
+	command -v systemctl >/dev/null 2>&1 || {
+		echo "systemd not available; skipping service setup (vpn-tunnel will manage the process directly)."
+		return 0
+	}
 	if systemctl cat sing-box.service >/dev/null 2>&1; then
 		return 0
 	fi
@@ -170,7 +174,7 @@ elif [ ! -f "$CONFIG_DIR/vless.url" ]; then
 fi
 
 ensure_systemd_service
-systemctl disable sing-box >/dev/null 2>&1 || true
+command -v systemctl >/dev/null 2>&1 && systemctl disable sing-box >/dev/null 2>&1 || true
 
 echo "Installed:"
 echo "  $PREFIX/bin/sing-box-apply-vless"

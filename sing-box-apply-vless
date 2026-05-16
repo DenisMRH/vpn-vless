@@ -423,9 +423,73 @@ def main() -> None:
     print(f"Wrote {CONFIG_PATH}")
 
     if args.no_restart:
-        print("Skipped systemd (--no-restart).")
+        print("Skipped service management (--no-restart).")
         return
 
+    if shutil.which("systemctl"):
+        _apply_with_systemctl(args.start)
+    else:
+        _apply_direct(args.start)
+
+
+_DIRECT_PID = "/run/sing-box.pid"
+_DIRECT_LOG = "/var/log/sing-box.log"
+
+
+def _direct_is_running() -> bool:
+    try:
+        with open(_DIRECT_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, FileNotFoundError):
+        return False
+
+
+def _direct_stop() -> None:
+    try:
+        with open(_DIRECT_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 15)  # SIGTERM
+        import time; time.sleep(0.5)
+    except (OSError, ValueError, FileNotFoundError):
+        pass
+    try:
+        os.remove(_DIRECT_PID)
+    except FileNotFoundError:
+        pass
+
+
+def _direct_start_process() -> None:
+    import time
+    log = open(_DIRECT_LOG, "a")
+    p = subprocess.Popen(
+        ["sing-box", "run", "-C", CONFIG_DIR],
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
+    with open(_DIRECT_PID, "w") as f:
+        f.write(str(p.pid) + "\n")
+    time.sleep(1)
+    if not _direct_is_running():
+        _die(f"sing-box failed to start. Check: {_DIRECT_LOG}")
+
+
+def _apply_direct(start: bool) -> None:
+    was_active = _direct_is_running()
+    if was_active:
+        _direct_stop()
+        _direct_start_process()
+        print(f"sing-box restarted (TUN VPN, pid {open(_DIRECT_PID).read().strip()}).")
+    elif start:
+        _direct_start_process()
+        print(f"sing-box started (TUN VPN, pid {open(_DIRECT_PID).read().strip()}).")
+    else:
+        print("VPN is off. Start with: sudo vpn-tunnel on")
+
+
+def _apply_with_systemctl(start: bool) -> None:
     st0 = subprocess.run(
         ["systemctl", "is-active", "sing-box"],
         capture_output=True,
@@ -435,7 +499,7 @@ def main() -> None:
 
     if was_active:
         subprocess.run(["systemctl", "restart", "sing-box"], check=False)
-    elif args.start:
+    elif start:
         subprocess.run(["systemctl", "start", "sing-box"], check=False)
     else:
         print("VPN is off. Start with: sudo vpn-tunnel on")
