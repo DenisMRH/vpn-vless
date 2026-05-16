@@ -226,11 +226,14 @@ def _parse_vless(url: str) -> dict:
 
 def _connected_subnet_rules() -> list[dict]:
     """Direct routes for each global address block on real interfaces (LAN / VPS subnet)."""
-    r = subprocess.run(
-        ["ip", "-j", "addr", "show", "up"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["ip", "-j", "addr", "show", "up"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
     if r.returncode != 0 or not (r.stdout or "").strip():
         return []
     try:
