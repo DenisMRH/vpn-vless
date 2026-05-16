@@ -79,7 +79,17 @@ _install_sing_box_apt() {
 	echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" \
 		>/etc/apt/sources.list.d/sagernet.list
 	apt-get update
+	# sing-box postinst calls systemd-sysusers, which is absent in minimal containers.
+	# Provide a no-op stub so dpkg doesn't fail; a real systemd host already has it.
+	if ! command -v systemd-sysusers >/dev/null 2>&1; then
+		printf '#!/bin/sh\nexit 0\n' >/usr/local/sbin/systemd-sysusers
+		chmod 755 /usr/local/sbin/systemd-sysusers
+		_STUB_SYSUSERS=1
+	fi
 	apt-get install -y sing-box
+	if [ "${_STUB_SYSUSERS:-0}" = "1" ]; then
+		rm -f /usr/local/sbin/systemd-sysusers
+	fi
 }
 
 install_sing_box() {
