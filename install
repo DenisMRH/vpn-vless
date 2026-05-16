@@ -67,6 +67,21 @@ need_file() {
 need_file "$SCRIPT_DIR/sing-box-apply-vless"
 need_file "$SCRIPT_DIR/vpn-tunnel"
 
+_install_sing_box_apt() {
+	# sing-box is not in the standard Ubuntu/Debian repos — add the official SFT Labs repository.
+	if ! command -v curl >/dev/null 2>&1; then
+		apt-get install -y curl
+	fi
+	install -d -m 755 /etc/apt/keyrings
+	curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
+	chmod a+r /etc/apt/keyrings/sagernet.asc
+	ARCH=$(dpkg --print-architecture)
+	echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" \
+		>/etc/apt/sources.list.d/sagernet.list
+	apt-get update
+	apt-get install -y sing-box
+}
+
 install_sing_box() {
 	if command -v sing-box >/dev/null 2>&1; then
 		return 0
@@ -77,14 +92,13 @@ install_sing_box() {
 sing-box is not installed.
 
 Install sing-box first, or rerun this installer with:
-  sudo ./tools/install-vpn-tunnel --install-sing-box
+  sudo ./install --install-sing-box
 EOF
 		exit 1
 	fi
 
 	if command -v apt-get >/dev/null 2>&1; then
-		apt-get update
-		apt-get install -y sing-box
+		_install_sing_box_apt
 	elif command -v dnf >/dev/null 2>&1; then
 		dnf install -y sing-box
 	elif command -v yum >/dev/null 2>&1; then
