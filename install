@@ -1,0 +1,177 @@
+#!/bin/sh
+# Install vpn-tunnel helpers for sing-box TUN VPN.
+set -eu
+
+PREFIX="/usr/local"
+CONFIG_DIR="/etc/sing-box"
+START_AFTER_APPLY=0
+APPLY_AFTER_INSTALL=1
+TRY_INSTALL_SING_BOX=0
+
+usage() {
+	code="${1:-2}"
+	cat >&2 <<'EOF'
+Usage: sudo ./install [options]
+
+Options:
+  --start             apply config and start VPN after installation
+  --no-apply          install scripts only; do not apply vless.url
+  --install-sing-box  try to install sing-box with the system package manager
+  -h, --help          show this help
+
+Optional environment:
+  VLESS_URL='vless://...'  write /etc/sing-box/vless.url before apply
+
+Examples:
+  sudo ./install
+  sudo VLESS_URL='vless://...' ./install --install-sing-box --start
+EOF
+	exit "$code"
+}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--start)
+		START_AFTER_APPLY=1
+		;;
+	--no-apply)
+		APPLY_AFTER_INSTALL=0
+		;;
+	--install-sing-box)
+		TRY_INSTALL_SING_BOX=1
+		;;
+	-h | --help)
+		usage 0
+		;;
+	*)
+		usage
+		;;
+	esac
+	shift
+done
+
+[ "$(id -u)" -eq 0 ] || {
+	echo "Run with sudo: sudo ./install" >&2
+	exit 1
+}
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+need_file() {
+	[ -f "$1" ] || {
+		echo "Missing required file: $1" >&2
+		exit 1
+	}
+}
+
+need_file "$SCRIPT_DIR/sing-box-apply-vless"
+need_file "$SCRIPT_DIR/vpn-tunnel"
+
+install_sing_box() {
+	if command -v sing-box >/dev/null 2>&1; then
+		return 0
+	fi
+
+	if [ "$TRY_INSTALL_SING_BOX" -ne 1 ]; then
+		cat >&2 <<'EOF'
+sing-box is not installed.
+
+Install sing-box first, or rerun this installer with:
+  sudo ./tools/install-vpn-tunnel --install-sing-box
+EOF
+		exit 1
+	fi
+
+	if command -v apt-get >/dev/null 2>&1; then
+		apt-get update
+		apt-get install -y sing-box
+	elif command -v dnf >/dev/null 2>&1; then
+		dnf install -y sing-box
+	elif command -v yum >/dev/null 2>&1; then
+		yum install -y sing-box
+	elif command -v pacman >/dev/null 2>&1; then
+		pacman -Sy --needed --noconfirm sing-box
+	elif command -v zypper >/dev/null 2>&1; then
+		zypper --non-interactive install sing-box
+	else
+		echo "Cannot install sing-box automatically: supported package manager not found." >&2
+		exit 1
+	fi
+
+	command -v sing-box >/dev/null 2>&1 || {
+		echo "Package manager finished, but sing-box is still unavailable in PATH." >&2
+		exit 1
+	}
+}
+
+ensure_systemd_service() {
+	if systemctl cat sing-box.service >/dev/null 2>&1; then
+		return 0
+	fi
+
+	cat >/etc/systemd/system/sing-box.service <<'EOF'
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart=/usr/bin/env sing-box run -C /etc/sing-box
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+}
+
+install_sing_box
+
+install -d -m 755 "$PREFIX/bin"
+install -m 755 "$SCRIPT_DIR/sing-box-apply-vless" "$PREFIX/bin/sing-box-apply-vless"
+install -m 755 "$SCRIPT_DIR/vpn-tunnel" "$PREFIX/bin/vpn-tunnel"
+
+install -d -m 755 "$CONFIG_DIR"
+[ -f "$CONFIG_DIR/direct-extras.txt" ] || install -m 644 /dev/null "$CONFIG_DIR/direct-extras.txt"
+
+if [ "${VLESS_URL:-}" ]; then
+	printf '%s\n' "$VLESS_URL" >"$CONFIG_DIR/vless.url"
+	chmod 600 "$CONFIG_DIR/vless.url"
+elif [ ! -f "$CONFIG_DIR/vless.url" ]; then
+	install -m 600 /dev/null "$CONFIG_DIR/vless.url"
+fi
+
+ensure_systemd_service
+systemctl disable sing-box >/dev/null 2>&1 || true
+
+echo "Installed:"
+echo "  $PREFIX/bin/sing-box-apply-vless"
+echo "  $PREFIX/bin/vpn-tunnel"
+echo "Config directory:"
+echo "  $CONFIG_DIR"
+
+if [ "$APPLY_AFTER_INSTALL" -eq 0 ]; then
+	echo "Skipped apply (--no-apply)."
+	exit 0
+fi
+
+if [ ! -s "$CONFIG_DIR/vless.url" ]; then
+	cat <<'EOF'
+No VLESS URL was provided yet.
+
+Next steps:
+  sudo nano /etc/sing-box/vless.url
+  sudo vpn-tunnel apply-start
+EOF
+	exit 0
+fi
+
+if [ "$START_AFTER_APPLY" -eq 1 ]; then
+	exec "$PREFIX/bin/vpn-tunnel" apply-start
+fi
+
+exec "$PREFIX/bin/vpn-tunnel" apply

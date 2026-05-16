@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Apply vless:// share link to sing-box (TUN VPN). Run with sudo."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import shutil
+import subprocess
+import sys
+from urllib.parse import parse_qs, unquote, urlparse
+
+CONFIG_DIR = "/etc/sing-box"
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+LINK_PATH = os.path.join(CONFIG_DIR, "vless.url")
+DIRECT_EXTRAS_PATH = os.path.join(CONFIG_DIR, "direct-extras.txt")
+
+
+def _die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _norm_qs(query: str) -> dict[str, list[str]]:
+    raw = parse_qs(query, keep_blank_values=True)
+    return {k.lower(): v for k, v in raw.items()}
+
+
+def _first(qs: dict[str, list[str]], *keys: str, default: str | None = None) -> str | None:
+    for k in keys:
+        if k not in qs:
+            continue
+        vals = qs[k]
+        if not vals:
+            continue
+        v = vals[0]
+        if v is None:
+            continue
+        if v == "" and default is not None:
+            return default
+        if v != "":
+            return v
+    return default
+
+
+def _truthy(qs: dict[str, list[str]], *keys: str) -> bool:
+    v = (_first(qs, *keys, default="") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _sanitize_vless_line(line: str) -> str:
+    """Drop junk after a second '#' (e.g. comment pasted on the same line as the share link)."""
+    s = line.strip()
+    if not s.startswith("vless://"):
+        return s
+    parts = s.split("#")
+    if len(parts) <= 2:
+        return s
+    return "#".join(parts[:2])
+
+
+def _read_vless_url(source: str | None, path: str, stdin: bool) -> str:
+    if stdin:
+        data = sys.stdin.read()
+    elif source:
+        data = source
+    else:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = f.read()
+        except OSError as e:
+            _die(f"Cannot read {path}: {e}\nCreate it or pass URL as argument.")
+
+    for line in data.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("vless://"):
+            return _sanitize_vless_line(s)
+    _die("No vless:// line found. Paste the link into vless.url or pass it as an argument.")
+
+
+def _parse_vless(url: str) -> dict:
+    u = urlparse(url.strip())
+    if (u.scheme or "").lower() != "vless":
+        _die("URL must start with vless://")
+
+    uuid = u.username
+    if not uuid:
+        _die("Missing UUID in vless URL")
+
+    host = u.hostname
+    if not host:
+        _die("Missing server host in vless URL")
+
+    port = u.port
+    if port is None:
+        port = 443
+
+    qs = _norm_qs(u.query)
+    remark = unquote(u.fragment) if u.fragment else ""
+
+    enc = (_first(qs, "encryption", default="none") or "none").lower()
+    if enc not in ("none", ""):
+        # VLESS encryption is almost always none; other values are nonstandard.
+        pass
+
+    security = (_first(qs, "security", default="none") or "none").lower()
+    net = (_first(qs, "type", default="tcp") or "tcp").lower()
+
+    if net in ("xhttp", "splithttp"):
+        _die(
+            "This sing-box package does not support the XHTTP transport.\n"
+            "Use a node with ws / tcp / grpc / httpupgrade / quic, or install a sing-box build with xhttp."
+        )
+
+    if net == "kcp":
+        _die("mKCP is not supported by sing-box.")
+
+    flow = _first(qs, "flow", default=None)
+    packet_enc = _first(qs, "packetencoding", "packet_encoding", default=None)
+
+    outbound: dict = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": host,
+        "server_port": port,
+        "uuid": uuid,
+    }
+    if flow:
+        outbound["flow"] = flow
+    if packet_enc:
+        outbound["packet_encoding"] = packet_enc
+
+    # TLS / REALITY
+    tls: dict = {"enabled": False}
+    if security in ("tls", "reality"):
+        tls["enabled"] = True
+        sni = _first(qs, "sni", "servername", default=None) or host
+        tls["server_name"] = sni
+        if _truthy(qs, "allowinsecure", "insecure", "skipcertverify"):
+            tls["insecure"] = True
+
+        alpn_raw = _first(qs, "alpn", default=None)
+        if alpn_raw:
+            tls["alpn"] = [a.strip() for a in alpn_raw.split(",") if a.strip()]
+
+        fp = _first(qs, "fp", "fingerprint", default=None)
+        if security == "reality" or fp:
+            tls["utls"] = {
+                "enabled": True,
+                "fingerprint": (fp or "chrome"),
+            }
+
+        if security == "reality":
+            pbk = _first(qs, "pbk", "publickey", default=None)
+            if not pbk:
+                _die("REALITY link missing pbk (public key)")
+            sid = _first(qs, "sid", "shortid", default="") or ""
+            # share links sometimes use comma-separated short ids
+            if "," in sid:
+                sid = sid.split(",")[0].strip()
+            tls["reality"] = {"enabled": True, "public_key": pbk, "short_id": sid}
+
+        outbound["tls"] = tls
+    elif security == "none":
+        pass
+    else:
+        _die(f"Unsupported security type: {security}")
+
+    # Transport
+    if net == "tcp":
+        pass
+    elif net == "ws":
+        path = unquote(_first(qs, "path", default="/") or "/")
+        host_header = _first(qs, "host", default=None)
+        headers: dict[str, str] = {}
+        if host_header:
+            headers["Host"] = host_header
+        ws: dict = {"type": "ws", "path": path}
+        if headers:
+            ws["headers"] = headers
+        ed = _first(qs, "ed", "maxearlydata", default=None)
+        if ed:
+            try:
+                ws["max_early_data"] = int(ed)
+            except ValueError:
+                pass
+        eh = _first(qs, "eh", "earlydataheadername", default=None)
+        if eh:
+            ws["early_data_header_name"] = eh
+        outbound["transport"] = ws
+    elif net == "grpc":
+        svc = (
+            _first(qs, "servicename", "service_name", default="") or "GunService"
+        )
+        outbound["transport"] = {"type": "grpc", "service_name": svc}
+    elif net in ("http", "h2"):
+        # Obfuscated HTTP; sing-box uses HTTP transport (not raw TCP).
+        path = unquote(_first(qs, "path", default="/") or "/")
+        host_header = _first(qs, "host", default=None)
+        hosts = [host_header] if host_header else []
+        outbound["transport"] = {
+            "type": "http",
+            "host": hosts,
+            "path": path,
+        }
+    elif net == "httpupgrade":
+        path = unquote(_first(qs, "path", default="/") or "/")
+        hu_host = _first(qs, "host", default="") or ""
+        outbound["transport"] = {
+            "type": "httpupgrade",
+            "host": hu_host,
+            "path": path,
+        }
+    elif net == "quic":
+        outbound["transport"] = {"type": "quic"}
+    else:
+        _die(f"Unsupported transport type in link: {net}")
+
+    return {"outbound": outbound, "remark": remark}
+
+
+def _connected_subnet_rules() -> list[dict]:
+    """Direct routes for each global address block on real interfaces (LAN / VPS subnet)."""
+    r = subprocess.run(
+        ["ip", "-j", "addr", "show", "up"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        return []
+    try:
+        ifaces = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    rules: list[dict] = []
+    seen: set[str] = set()
+    skip_prefixes = ("lo", "docker", "br-", "veth", "virbr", "wg", "tailscale")
+    for iface in ifaces:
+        name = iface.get("ifname") or ""
+        if not name or name == "lo" or name.startswith(("tun", "meta")):
+            continue
+        if any(name.startswith(p) for p in skip_prefixes):
+            continue
+        for info in iface.get("addr_info") or []:
+            if info.get("family") not in ("inet", "inet6"):
+                continue
+            if info.get("scope") != "global":
+                continue
+            local = info.get("local")
+            plen = info.get("prefixlen")
+            if not local or plen is None:
+                continue
+            try:
+                plen_i = int(plen)
+                net = ipaddress.ip_interface(f"{local}/{plen_i}").network
+            except (ValueError, TypeError):
+                continue
+            key = str(net)
+            if key in seen:
+                continue
+            seen.add(key)
+            rules.append(
+                {"ip_cidr": [key], "action": "route", "outbound": "direct"}
+            )
+    return rules
+
+
+def _parse_direct_extras_line(line: str) -> dict | None:
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    low = s.lower()
+    if low.startswith("domain:"):
+        dom = s.split(":", 1)[1].strip()
+        if dom:
+            return {
+                "domain": [dom],
+                "action": "route",
+                "outbound": "direct",
+            }
+        return None
+    if low.startswith("suffix:"):
+        suf = s.split(":", 1)[1].strip()
+        if suf:
+            return {
+                "domain_suffix": [suf],
+                "action": "route",
+                "outbound": "direct",
+            }
+        return None
+    return {"ip_cidr": [s], "action": "route", "outbound": "direct"}
+
+
+def _load_direct_extras(path: str) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    rules: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                rule = _parse_direct_extras_line(line)
+                if rule:
+                    rules.append(rule)
+    except OSError:
+        return []
+    return rules
+
+
+def build_config(outbound: dict) -> dict:
+    connected = _connected_subnet_rules()
+    extras = _load_direct_extras(DIRECT_EXTRAS_PATH)
+    rules: list[dict] = [
+        {"ip_is_private": True, "action": "route", "outbound": "direct"},
+    ]
+    rules.extend(connected)
+    rules.extend(extras)
+    rules.append({"protocol": "dns", "action": "hijack-dns"})
+
+    return {
+        "log": {"level": "info"},
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            outbound,
+            {"type": "block", "tag": "block"},
+        ],
+        # Do not set dns detour to "direct" with TUN: sing-box fails at runtime ("empty direct outbound").
+        # Do not use detour "proxy" either: resolving the VPN server host loops. Default dial for this UDP DNS works.
+        "dns": {
+            "servers": [
+                {
+                    "type": "udp",
+                    "tag": "remote",
+                    "server": "8.8.8.8",
+                }
+            ]
+        },
+        "inbounds": [
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+                "auto_route": True,
+                "strict_route": True,
+                "stack": "system",
+            }
+        ],
+        "route": {
+            "auto_detect_interface": True,
+            "final": "proxy",
+            "rules": rules,
+        },
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Apply vless:// link to sing-box TUN VPN")
+    ap.add_argument("url", nargs="?", help="vless://… (optional if vless.url exists)")
+    ap.add_argument(
+        "-f",
+        "--file",
+        default=LINK_PATH,
+        help=f"File with link (default: {LINK_PATH})",
+    )
+    ap.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read link from stdin",
+    )
+    ap.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Write config and check only; do not touch systemd",
+    )
+    ap.add_argument(
+        "--start",
+        action="store_true",
+        help="After apply, start sing-box even if it was stopped",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print JSON to stdout; do not write files",
+    )
+    args = ap.parse_args()
+
+    if os.geteuid() != 0 and not args.dry_run:
+        _die("Run with sudo: sudo sing-box-apply-vless")
+
+    raw = _read_vless_url(args.url, args.file, args.stdin)
+    parsed = _parse_vless(raw)
+    cfg = build_config(parsed["outbound"])
+
+    if args.dry_run:
+        json.dump(cfg, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+
+    os.makedirs(CONFIG_DIR, mode=0o755, exist_ok=True)
+    if os.path.isfile(CONFIG_PATH):
+        shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak")
+
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+    r = subprocess.run(
+        ["sing-box", "check", "-C", CONFIG_DIR],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        _die(f"sing-box rejected config:\n{err}")
+
+    if parsed["remark"]:
+        print(f"Profile name (fragment): {parsed['remark']}")
+    print(f"Wrote {CONFIG_PATH}")
+
+    if args.no_restart:
+        print("Skipped systemd (--no-restart).")
+        return
+
+    st0 = subprocess.run(
+        ["systemctl", "is-active", "sing-box"],
+        capture_output=True,
+        text=True,
+    )
+    was_active = st0.stdout.strip() == "active"
+
+    if was_active:
+        subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+    elif args.start:
+        subprocess.run(["systemctl", "start", "sing-box"], check=False)
+    else:
+        print("VPN is off. Start with: sudo vpn-tunnel on")
+        return
+
+    st = subprocess.run(
+        ["systemctl", "is-active", "sing-box"],
+        capture_output=True,
+        text=True,
+    )
+    if st.stdout.strip() != "active":
+        _die(
+            "sing-box failed to stay active. See: journalctl -u sing-box -e --no-pager"
+        )
+    print("sing-box is active (TUN VPN).")
+
+
+if __name__ == "__main__":
+    main()

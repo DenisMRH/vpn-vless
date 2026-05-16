@@ -1,0 +1,31 @@
+#!/bin/sh
+# Управление TUN VPN (sing-box). Нужны права root.
+set -e
+
+usage() {
+	echo "Usage: sudo vpn-tunnel {on|off|status|restart|apply|apply-start}" >&2
+	echo "  on|up      — поднять туннель (systemctl start sing-box)" >&2
+	echo "  off|down   — опустить туннель" >&2
+	echo "  status     — состояние сервиса" >&2
+	echo "  restart    — перезапуск с текущим config" >&2
+	echo "  apply      — пересобрать config из vless.url; VPN вкл. только если уже был вкл." >&2
+	echo "  apply-start — как apply, затем включить VPN" >&2
+	exit 2
+}
+
+[ "$(id -u)" -eq 0 ] || {
+	echo "Run: sudo vpn-tunnel ..." >&2
+	exit 1
+}
+
+cmd="${1:-}"
+case "$cmd" in
+on | up | start) systemctl start sing-box ;;
+off | down | stop) systemctl stop sing-box ;;
+status) systemctl status sing-box --no-pager ;;
+restart) systemctl restart sing-box ;;
+apply) exec sing-box-apply-vless ;;
+apply-start) exec sing-box-apply-vless --start ;;
+"") usage ;;
+*) usage ;;
+esac
