@@ -5,7 +5,7 @@
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/DenisMRH/sing-box-vless-vpn.git
+git clone git@github.com:DenisMRH/vpn-vless.git
 cd sing-box-vless-vpn
 sudo VLESS_URL='vless://...' ./install --install-sing-box --start
 ```
